@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Home Automation 4-Relay</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+</head>
+<body class="bg-gray-900 text-white flex items-center justify-center min-h-screen">
+
+  <div class="bg-gray-800 p-8 rounded-2xl shadow-2xl w-full max-w-md text-center">
+    <h1 class="text-3xl font-bold mb-6">Home Automation Control</h1>
+
+    <div id="relayContainer" class="flex flex-col gap-4"></div>
+
+    <div class="mt-6 text-sm text-gray-300">
+      Last Command Sent: <span id="lastCommand">None</span>
+    </div>
+  </div>
+
+  <script>
+    const mqttServer = "wss://e6e7dac5f1a2475382f05acc556ef6d7.s1.eu.hivemq.cloud:8884/mqtt";
+    const mqttUser = "dipudas";
+    const mqttPassword = "Dipu2002";
+    const clientId = "web_relay_controller_" + Math.floor(Math.random() * 1000);
+
+    const NUM_RELAYS = 4;
+    const relays = [];
+    const states = {};
+
+    // Generate topics for each relay
+    const topicsCommand = [];
+    const topicsStatus  = [];
+    for (let i=1; i<=NUM_RELAYS; i++) {
+      topicsCommand.push(`home/relay${i}/command`);
+      topicsStatus.push(`home/relay${i}/status`);
+    }
+
+    const topicGetStates = "home/relay/get_states";
+
+    // Connect to MQTT broker
+    const client = mqtt.connect(mqttServer, {
+      clientId: clientId,
+      username: mqttUser,
+      password: mqttPassword,
+      reconnectPeriod: 2000,
+      clean: true
+    });
+
+    const relayContainer = document.getElementById('relayContainer');
+    const lastCommandEl = document.getElementById('lastCommand');
+
+    // Create UI toggles
+    for (let i=1; i<=NUM_RELAYS; i++) {
+      const div = document.createElement('div');
+      div.className = "flex items-center justify-between";
+      div.innerHTML = `
+        <span class="text-lg font-medium">Relay ${i}</span>
+        <label class="relative inline-flex items-center cursor-pointer">
+          <input type="checkbox" id="relay${i}" class="sr-only peer">
+          <div class="w-14 h-8 bg-gray-600 rounded-full peer peer-checked:bg-blue-500 transition-colors"></div>
+          <div class="absolute left-1 top-1 w-6 h-6 bg-white rounded-full peer-checked:translate-x-6 transform transition-transform"></div>
+        </label>
+      `;
+      relayContainer.appendChild(div);
+
+      const checkbox = document.getElementById(`relay${i}`);
+      states[i] = false;
+
+      // Toggle relay on click
+      checkbox.addEventListener('change', () => {
+        const state = checkbox.checked ? "ON" : "OFF";
+        client.publish(topicsCommand[i-1], state);
+
+        lastCommandEl.textContent = `Relay ${i} -> ${state}`;
+      });
+    }
+
+    client.on('connect', () => {
+      console.log("✅ Connected to MQTT broker");
+
+      // Subscribe to status topics
+      topicsStatus.forEach(t => client.subscribe(t));
+
+      // Subscribe to get states topic
+      client.subscribe(topicGetStates);
+
+      // Request current relay states from ESP
+      client.publish(topicGetStates, "request");
+    });
+
+    client.on('error', (err) => console.error("❌ MQTT Error:", err));
+
+    client.on('message', (topic, message) => {
+      const msg = message.toString();
+
+      // Status updates from ESP
+      const relayIndex = topicsStatus.indexOf(topic);
+      if (relayIndex !== -1) {
+        const state = msg.includes("ON");
+        states[relayIndex+1] = state;
+        const checkbox = document.getElementById(`relay${relayIndex+1}`);
+        if (checkbox) checkbox.checked = state;
+      }
+
+      // Optional: handle get_states if ESP sends something
+      if (topic === topicGetStates) {
+        console.log("[INFO] Get states response:", msg);
+      }
+    });
+
+  </script>
+</body>
+</html>
+
