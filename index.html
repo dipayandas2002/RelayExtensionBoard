@@ -12,7 +12,7 @@
   <div class="bg-gray-800 p-8 rounded-2xl shadow-2xl w-full max-w-md text-center">
     <h1 class="text-3xl font-bold mb-6">Home Automation Control</h1>
 
-    <div id="relayContainer" class="flex flex-col gap-4"></div>
+    <div id="relayContainer" class="flex flex-col gap-6"></div>
 
     <div class="mt-6 text-sm text-gray-300">
       Last Command Sent: <span id="lastCommand">None</span>
@@ -26,22 +26,19 @@
     const clientId = "web_relay_controller_" + Math.floor(Math.random() * 1000);
 
     const NUM_RELAYS = 4;
-    const relays = [];
     const states = {};
-
-    // Generate topics for each relay
     const topicsCommand = [];
     const topicsStatus  = [];
-    for (let i=1; i<=NUM_RELAYS; i++) {
+    const topicGetStates = "home/relay/get_states";
+    const topicSetTimer  = "home/relay/set_timer"; // <--- NEW
+
+    for (let i = 1; i <= NUM_RELAYS; i++) {
       topicsCommand.push(`home/relay${i}/command`);
       topicsStatus.push(`home/relay${i}/status`);
     }
 
-    const topicGetStates = "home/relay/get_states";
-
-    // Connect to MQTT broker
     const client = mqtt.connect(mqttServer, {
-      clientId: clientId,
+      clientId,
       username: mqttUser,
       password: mqttPassword,
       reconnectPeriod: 2000,
@@ -51,66 +48,108 @@
     const relayContainer = document.getElementById('relayContainer');
     const lastCommandEl = document.getElementById('lastCommand');
 
-    // Create UI toggles
-    for (let i=1; i<=NUM_RELAYS; i++) {
+    // Build Relay UI
+    for (let i = 1; i <= NUM_RELAYS; i++) {
       const div = document.createElement('div');
-      div.className = "flex items-center justify-between";
+      div.className = "p-4 bg-gray-700 rounded-xl shadow flex flex-col gap-3";
+
       div.innerHTML = `
-        <span class="text-lg font-medium">Relay ${i}</span>
-        <label class="relative inline-flex items-center cursor-pointer">
-          <input type="checkbox" id="relay${i}" class="sr-only peer">
-          <div class="w-14 h-8 bg-gray-600 rounded-full peer peer-checked:bg-blue-500 transition-colors"></div>
-          <div class="absolute left-1 top-1 w-6 h-6 bg-white rounded-full peer-checked:translate-x-6 transform transition-transform"></div>
-        </label>
+        <div class="flex items-center justify-between">
+          <span class="text-lg font-medium">Relay ${i}</span>
+          <label class="relative inline-flex items-center cursor-pointer">
+            <input type="checkbox" id="relay${i}" class="sr-only peer">
+            <div class="w-14 h-8 bg-gray-600 rounded-full peer peer-checked:bg-blue-500 transition-colors"></div>
+            <div class="absolute left-1 top-1 w-6 h-6 bg-white rounded-full peer-checked:translate-x-6 transform transition-transform"></div>
+          </label>
+        </div>
+
+        <div class="grid grid-cols-2 gap-2 text-sm text-gray-300">
+          <div>
+            <label class="block mb-1">ON Time</label>
+            <input type="time" id="onTime${i}" class="w-full p-1 rounded bg-gray-800 border border-gray-600 text-white">
+          </div>
+          <div>
+            <label class="block mb-1">OFF Time</label>
+            <input type="time" id="offTime${i}" class="w-full p-1 rounded bg-gray-800 border border-gray-600 text-white">
+          </div>
+        </div>
+
+        <div class="flex items-center justify-between mt-2">
+          <label class="flex items-center gap-2">
+            <input type="checkbox" id="enableTimer${i}" class="w-4 h-4 accent-blue-500">
+            Enable Timer
+          </label>
+          <button id="saveTimer${i}" class="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1 rounded text-sm">
+            Save Timer
+          </button>
+        </div>
       `;
+
       relayContainer.appendChild(div);
 
       const checkbox = document.getElementById(`relay${i}`);
       states[i] = false;
 
-      // Toggle relay on click
+      // Manual toggle
       checkbox.addEventListener('change', () => {
         const state = checkbox.checked ? "ON" : "OFF";
-        client.publish(topicsCommand[i-1], state);
-
+        client.publish(topicsCommand[i - 1], state);
         lastCommandEl.textContent = `Relay ${i} -> ${state}`;
+      });
+
+      // Timer save button
+      const saveBtn = document.getElementById(`saveTimer${i}`);
+      saveBtn.addEventListener('click', () => {
+        const onTime = document.getElementById(`onTime${i}`).value;
+        const offTime = document.getElementById(`offTime${i}`).value;
+        const enabled = document.getElementById(`enableTimer${i}`).checked;
+
+        if (!onTime || !offTime) {
+          alert("Please set both ON and OFF times!");
+          return;
+        }
+
+        const json = {
+          relay: i,
+          on: onTime,
+          off: offTime,
+          enabled: enabled
+        };
+
+        client.publish(topicSetTimer, JSON.stringify(json));
+        lastCommandEl.textContent = `Relay ${i} Timer -> ${onTime} to ${offTime} (${enabled ? "ENABLED" : "DISABLED"})`;
+        console.log("[MQTT] Timer sent:", json);
       });
     }
 
+    // MQTT CONNECTION EVENTS
     client.on('connect', () => {
       console.log("✅ Connected to MQTT broker");
 
-      // Subscribe to status topics
       topicsStatus.forEach(t => client.subscribe(t));
-
-      // Subscribe to get states topic
       client.subscribe(topicGetStates);
 
-      // Request current relay states from ESP
+      // Get initial relay states
       client.publish(topicGetStates, "request");
     });
 
-    client.on('error', (err) => console.error("❌ MQTT Error:", err));
+    client.on('error', err => console.error("❌ MQTT Error:", err));
 
     client.on('message', (topic, message) => {
       const msg = message.toString();
-
-      // Status updates from ESP
       const relayIndex = topicsStatus.indexOf(topic);
+
       if (relayIndex !== -1) {
         const state = msg.includes("ON");
-        states[relayIndex+1] = state;
-        const checkbox = document.getElementById(`relay${relayIndex+1}`);
+        states[relayIndex + 1] = state;
+        const checkbox = document.getElementById(`relay${relayIndex + 1}`);
         if (checkbox) checkbox.checked = state;
       }
 
-      // Optional: handle get_states if ESP sends something
       if (topic === topicGetStates) {
         console.log("[INFO] Get states response:", msg);
       }
     });
-
   </script>
 </body>
 </html>
-
