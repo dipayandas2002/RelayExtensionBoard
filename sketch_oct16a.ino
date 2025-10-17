@@ -1,8 +1,14 @@
 #include <ESP8266WiFi.h>
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
-#include <EEPROM.h>             // --- ADDED ---
-#include <time.h>               // --- ADDED ---
+#include <EEPROM.h>
+#include <time.h>
+
+// ------------------------
+// CONFIGURATION
+// ------------------------
+#define NUM_RELAYS 4
+const int relayPins[NUM_RELAYS] = {5, 4, 14, 12};  // D1, D2, D5, D6
 
 const char* ssid = "POCOX3";
 const char* password = "dipayandas2002";
@@ -12,18 +18,21 @@ const int mqtt_port = 8883;
 const char* mqtt_user = "dipudas";
 const char* mqtt_pass = "Dipu2002";
 
-#define NUM_RELAYS 4
-int relayPins[NUM_RELAYS] = {5, 4, 14, 12};
-bool relayState[NUM_RELAYS] = {false, false, false, false};
-
-// --- ADDED: SCHEDULE STRUCT ---
+// ------------------------
+// RELAY & TIMER DATA
+// ------------------------
 struct Schedule {
   int onHour, onMinute;
   int offHour, offMinute;
   bool enabled;
-} relaySchedule[NUM_RELAYS];
+};
 
-// MQTT Topics
+bool relayState[NUM_RELAYS] = {false, false, false, false};
+Schedule relaySchedule[NUM_RELAYS];
+
+// ------------------------
+// MQTT TOPICS
+// ------------------------
 const char* topicCommand[NUM_RELAYS] = {
   "home/relay1/command",
   "home/relay2/command",
@@ -37,42 +46,34 @@ const char* topicStatus[NUM_RELAYS] = {
   "home/relay4/status"
 };
 const char* topicGetStates = "home/relay/get_states";
-const char* topicSetTimer = "home/relay/set_timer"; // --- ADDED ---
+const char* topicSetTimer  = "home/relay/set_timer";
 
 WiFiClientSecure wifiSecureClient;
 PubSubClient client(wifiSecureClient);
 
-// ----------------------
-// EEPROM FUNCTIONS
-// ----------------------
-void saveToEEPROM() { // --- ADDED ---
+// ------------------------
+// EEPROM SAVE / LOAD
+// ------------------------
+void saveToEEPROM() {
   EEPROM.begin(512);
   int addr = 0;
 
-  // Save relay states
-  for (int i = 0; i < NUM_RELAYS; i++) {
-    EEPROM.write(addr++, relayState[i]);
-  }
-
-  // Save schedules
+  for (int i = 0; i < NUM_RELAYS; i++) EEPROM.write(addr++, relayState[i]);
   for (int i = 0; i < NUM_RELAYS; i++) {
     EEPROM.put(addr, relaySchedule[i]);
     addr += sizeof(Schedule);
   }
 
   EEPROM.commit();
+  EEPROM.end();
+  Serial.println("[EEPROM] Data saved");
 }
 
-void loadFromEEPROM() { // --- ADDED ---
+void loadFromEEPROM() {
   EEPROM.begin(512);
   int addr = 0;
 
-  // Load relay states
-  for (int i = 0; i < NUM_RELAYS; i++) {
-    relayState[i] = EEPROM.read(addr++);
-  }
-
-  // Load schedules
+  for (int i = 0; i < NUM_RELAYS; i++) relayState[i] = EEPROM.read(addr++);
   for (int i = 0; i < NUM_RELAYS; i++) {
     EEPROM.get(addr, relaySchedule[i]);
     addr += sizeof(Schedule);
@@ -80,170 +81,187 @@ void loadFromEEPROM() { // --- ADDED ---
 
   EEPROM.end();
 
-  // Apply states
-  for (int i = 0; i < NUM_RELAYS; i++) {
+  for (int i = 0; i < NUM_RELAYS; i++)
     digitalWrite(relayPins[i], relayState[i] ? HIGH : LOW);
+
+  Serial.println("[EEPROM] Data loaded");
+}
+
+// ------------------------
+// TIME UTILS
+// ------------------------
+void printLocalTime() {
+  time_t now = getCurrentTimeOfflineSafe();
+  struct tm* t = localtime(&now);
+  Serial.printf("[TIME] %02d:%02d:%02d %02d/%02d/%04d\n",
+                t->tm_hour, t->tm_min, t->tm_sec,
+                t->tm_mday, t->tm_mon + 1, t->tm_year + 1900);
+}
+
+// ------------------------
+// TIME MAINTENANCE
+// ------------------------
+unsigned long lastNtpSync = 0;
+unsigned long lastMillisBase = 0;
+time_t lastSyncedEpoch = 0;
+
+time_t getCurrentTimeOfflineSafe() {
+  unsigned long elapsed = (millis() - lastMillisBase) / 1000;
+  return lastSyncedEpoch + elapsed;
+}
+
+void syncNtpIfNeeded() {
+  static bool firstSyncDone = false;
+  unsigned long nowMillis = millis();
+
+  if (WiFi.status() == WL_CONNECTED &&
+      (!firstSyncDone || nowMillis - lastNtpSync > 1800000)) { // 30 min
+    Serial.println("[TIME] Re-syncing NTP...");
+    configTime(19800, 0, "pool.ntp.org", "time.nist.gov");
+    delay(1000);
+
+    time_t now = time(nullptr);
+    if (now > 100000) {
+      lastSyncedEpoch = now;
+      lastMillisBase = millis();
+      lastNtpSync = nowMillis;
+      firstSyncDone = true;
+      Serial.println("[TIME] NTP sync OK");
+      printLocalTime();
+    } else {
+      Serial.println("[TIME] NTP sync failed, will retry later");
+    }
   }
 }
 
-// ----------------------
-// Publish a relay state
-// ----------------------
+// ------------------------
+// MQTT PUBLISH
+// ------------------------
 void publishStatus(int ch) {
-  char payload[100];
+  char payload[150];
+  time_t now = getCurrentTimeOfflineSafe();
+  struct tm* t = localtime(&now);
   snprintf(payload, sizeof(payload),
-           "{\"relay\": %d, \"state\": \"%s\", \"timestamp\": %lu}",
-           ch + 1, relayState[ch] ? "ON" : "OFF", millis());
+           "{\"relay\":%d,\"state\":\"%s\",\"time\":\"%02d:%02d\",\"on\":\"%02d:%02d\",\"off\":\"%02d:%02d\",\"enabled\":%s}",
+           ch + 1,
+           relayState[ch] ? "ON" : "OFF",
+           t->tm_hour, t->tm_min,
+           relaySchedule[ch].onHour, relaySchedule[ch].onMinute,
+           relaySchedule[ch].offHour, relaySchedule[ch].offMinute,
+           relaySchedule[ch].enabled ? "true" : "false");
+
   client.publish(topicStatus[ch], payload, true);
-  Serial.printf("[OUT] Published status -> Topic: %s, Payload: %s\n", topicStatus[ch], payload);
+  Serial.printf("[OUT] %s -> %s\n", topicStatus[ch], payload);
 }
 
-// ----------------------
-// Handle command for a relay
-// ----------------------
+// ------------------------
+// MQTT COMMAND HANDLER
+// ------------------------
 void handleCommand(const char* topic, const String& cmd) {
-  Serial.printf("[IN ] Received command -> Topic: %s, Payload: %s\n", topic, cmd.c_str());
   for (int i = 0; i < NUM_RELAYS; i++) {
     if (String(topic) == topicCommand[i]) {
-      bool newState = relayState[i];
-      if (cmd.equalsIgnoreCase("ON")) newState = true;
-      else if (cmd.equalsIgnoreCase("OFF")) newState = false;
-
-      if (newState != relayState[i]) {
+      bool newState = cmd.equalsIgnoreCase("ON");
+      if (relayState[i] != newState) {
         relayState[i] = newState;
         digitalWrite(relayPins[i], relayState[i] ? HIGH : LOW);
-        Serial.printf("[INFO] Relay %d set to %s\n", i + 1, relayState[i] ? "ON" : "OFF");
         publishStatus(i);
-        saveToEEPROM(); // --- ADDED ---
+        saveToEEPROM();
+        Serial.printf("[CMD] Relay %d -> %s\n", i + 1, newState ? "ON" : "OFF");
       }
     }
   }
 }
 
-// ----------------------
-// Handle timer setup (REPLACE EXISTING FUNCTION)
-// ----------------------
+// ------------------------
+// TIMER SETUP HANDLER
+// ------------------------
 void handleTimerSetup(const String& payload) {
-  // Expected JSON: {"relay":1,"on":"12:30","off":"14:45","enabled":true}
-  Serial.printf("[TIMER-IN] raw payload: %s\n", payload.c_str());
-
-  // Default invalid index
+  Serial.printf("[TIMER-IN] %s\n", payload.c_str());
   int relayIndex = -1;
 
-  // --- parse relay ---
   int pRelay = payload.indexOf("\"relay\":");
   if (pRelay >= 0) {
     int start = pRelay + 8;
     int end = payload.indexOf(',', start);
     if (end == -1) end = payload.indexOf('}', start);
-    if (end > start) {
-      relayIndex = payload.substring(start, end).toInt() - 1;
-    }
+    relayIndex = payload.substring(start, end).toInt() - 1;
   }
 
   if (relayIndex < 0 || relayIndex >= NUM_RELAYS) {
-    Serial.println("[TIMER-ERR] invalid relay index");
+    Serial.println("[TIMER-ERR] Invalid relay index");
     return;
   }
 
-  // Helper lambda to parse a "HH:MM" string after a key like "\"on\":\""
-  auto parseTimeField = [&](const String &key, int &outH, int &outM) -> bool {
-    outH = outM = 0;
-    String needle = String("\"") + key + String("\":\"");
-    int p = payload.indexOf(needle);
+  auto parseTime = [&](String key, int &h, int &m) {
+    int p = payload.indexOf("\"" + key + "\":\"");
     if (p < 0) return false;
-    int start = p + needle.length();               // start points at first digit of HH
-    int colonPos = payload.indexOf(':', start);    // look for the colon inside the time
-    if (colonPos < 0) return false;
-    int endQuote = payload.indexOf('"', colonPos); // closing quote after MM
-    if (endQuote < 0) return false;
-
-    String sh = payload.substring(start, colonPos);
-    String sm = payload.substring(colonPos + 1, endQuote);
-    // sanity trim
-    sh.trim(); sm.trim();
-    if (sh.length() == 0 || sm.length() == 0) return false;
-
-    outH = sh.toInt();
-    outM = sm.toInt();
-    // validate ranges
-    if (outH < 0 || outH > 23) return false;
-    if (outM < 0 || outM > 59) return false;
+    p += key.length() + 4;
+    int colon = payload.indexOf(':', p);
+    int end = payload.indexOf('"', colon);
+    if (colon < 0 || end < 0) return false;
+    h = payload.substring(p, colon).toInt();
+    m = payload.substring(colon + 1, end).toInt();
     return true;
   };
 
-  // --- parse on time ---
-  int onH=0, onM=0, offH=0, offM=0;
-  bool gotOn = parseTimeField("on", onH, onM);
-  bool gotOff = parseTimeField("off", offH, offM);
-
-  // --- parse enabled ---
-  bool enabled = false;
-  int pEnabled = payload.indexOf("\"enabled\":");
-  if (pEnabled >= 0) {
-    int startE = pEnabled + 10;
-    // check substring true/false
-    String rem = payload.substring(startE);
-    rem.trim();
-    if (rem.startsWith("true")) enabled = true;
-    else enabled = false;
-  }
-
-  // If at least one time parsed (prefer both) then set schedule
-  if (!gotOn || !gotOff) {
-    Serial.println("[TIMER-ERR] could not parse on/off times correctly");
-    Serial.printf("[TIMER-ERR] gotOn=%d gotOff=%d\n", gotOn ? 1 : 0, gotOff ? 1 : 0);
+  int onH, onM, offH, offM;
+  if (!parseTime("on", onH, onM) || !parseTime("off", offH, offM)) {
+    Serial.println("[TIMER-ERR] Parse failed");
     return;
   }
 
-  relaySchedule[relayIndex].onHour = onH;
-  relaySchedule[relayIndex].onMinute = onM;
-  relaySchedule[relayIndex].offHour = offH;
-  relaySchedule[relayIndex].offMinute = offM;
-  relaySchedule[relayIndex].enabled = enabled;
+  bool enabled = payload.indexOf("\"enabled\":true") >= 0;
 
-  Serial.printf("[TIMER] Relay %d Timer set -> ON: %02d:%02d OFF: %02d:%02d Enabled: %d\n",
-                relayIndex + 1, onH, onM, offH, offM, enabled ? 1 : 0);
-
+  relaySchedule[relayIndex] = {onH, onM, offH, offM, enabled};
   saveToEEPROM();
+
+  Serial.printf("[TIMER] Relay %d: %02d:%02d -> %02d:%02d, enabled=%d\n",
+                relayIndex + 1, onH, onM, offH, offM, enabled);
+  publishStatus(relayIndex);
 }
 
-// ----------------------
-// Check schedules
-// ----------------------
-void checkSchedules() { // --- ADDED ---
-  time_t now = time(nullptr);
+// ------------------------
+// SCHEDULE CHECK WITH MANUAL OVERRIDE
+// ------------------------
+void checkSchedules() {
+  time_t now = getCurrentTimeOfflineSafe();
   struct tm* t = localtime(&now);
-  int curH = t->tm_hour;
-  int curM = t->tm_min;
+  int curSecs = t->tm_hour * 3600 + t->tm_min * 60 + t->tm_sec;
 
   for (int i = 0; i < NUM_RELAYS; i++) {
     if (!relaySchedule[i].enabled) continue;
 
-    int onMins = relaySchedule[i].onHour * 60 + relaySchedule[i].onMinute;
-    int offMins = relaySchedule[i].offHour * 60 + relaySchedule[i].offMinute;
-    int curMins = curH * 60 + curM;
+    int onSecs  = relaySchedule[i].onHour * 3600 + relaySchedule[i].onMinute * 60;
+    int offSecs = relaySchedule[i].offHour * 3600 + relaySchedule[i].offMinute * 60;
 
-    bool shouldBeOn = (curMins >= onMins && curMins < offMins);
-    if (shouldBeOn != relayState[i]) {
-      relayState[i] = shouldBeOn;
-      digitalWrite(relayPins[i], relayState[i] ? HIGH : LOW);
+    // Turn ON exactly at scheduled ON time if relay is OFF
+    if (curSecs == onSecs && !relayState[i]) {
+      relayState[i] = true;
+      digitalWrite(relayPins[i], HIGH);
       publishStatus(i);
       saveToEEPROM();
-      Serial.printf("[AUTO] Relay %d turned %s by schedule\n", i + 1, relayState[i] ? "ON" : "OFF");
+      Serial.printf("[AUTO] Relay %d -> ON (by schedule)\n", i + 1);
+    }
+
+    // Turn OFF exactly at scheduled OFF time if relay is ON
+    if (curSecs == offSecs && relayState[i]) {
+      relayState[i] = false;
+      digitalWrite(relayPins[i], LOW);
+      publishStatus(i);
+      saveToEEPROM();
+      Serial.printf("[AUTO] Relay %d -> OFF (by schedule)\n", i + 1);
     }
   }
 }
 
-// ----------------------
-// MQTT callback
-// ----------------------
+// ------------------------
+// MQTT CALLBACK
+// ------------------------
 void callback(char* topic, byte* payload, unsigned int length) {
-  String cmd = "";
+  String cmd;
   for (unsigned int i = 0; i < length; i++) cmd += (char)payload[i];
 
   if (String(topic) == topicGetStates) {
-    Serial.println("[IN ] Get states request received");
     for (int i = 0; i < NUM_RELAYS; i++) publishStatus(i);
   } else if (String(topic) == topicSetTimer) {
     handleTimerSetup(cmd);
@@ -252,39 +270,42 @@ void callback(char* topic, byte* payload, unsigned int length) {
   }
 }
 
-// ----------------------
-// Wi-Fi & MQTT Connect
-// ----------------------
+// ------------------------
+// WIFI + MQTT CONNECTION
+// ------------------------
 void connectWiFi() {
   if (WiFi.status() == WL_CONNECTED) return;
   WiFi.begin(ssid, password);
+  Serial.print("[WiFi] Connecting");
   while (WiFi.status() != WL_CONNECTED) {
-    delay(250);
+    delay(300);
     Serial.print(".");
   }
-  Serial.println("\nWiFi connected: " + WiFi.localIP().toString());
+  Serial.println("\n[WiFi] Connected: " + WiFi.localIP().toString());
 }
 
 void connectMQTT() {
   if (client.connected()) return;
+  Serial.print("[MQTT] Connecting...");
   if (client.connect("ESP8266_4Relay_TLS", mqtt_user, mqtt_pass)) {
-    Serial.println("MQTT connected.");
-
+    Serial.println("Connected!");
     for (int i = 0; i < NUM_RELAYS; i++) client.subscribe(topicCommand[i]);
     client.subscribe(topicGetStates);
-    client.subscribe(topicSetTimer); // --- ADDED ---
-
+    client.subscribe(topicSetTimer);
     for (int i = 0; i < NUM_RELAYS; i++) publishStatus(i);
   } else {
-    Serial.printf("MQTT connect failed, rc=%d\n", client.state());
+    Serial.printf("Failed, rc=%d\n", client.state());
   }
 }
 
-// ----------------------
-// Setup & Loop
-// ----------------------
+// ------------------------
+// SETUP
+// ------------------------
 void setup() {
   Serial.begin(115200);
+  delay(200);
+  Serial.println("\n[BOOT] Starting 4-Relay MQTT Controller...");
+
   for (int i = 0; i < NUM_RELAYS; i++) {
     pinMode(relayPins[i], OUTPUT);
     digitalWrite(relayPins[i], LOW);
@@ -295,19 +316,38 @@ void setup() {
   client.setServer(mqtt_server, mqtt_port);
   client.setCallback(callback);
 
-  // --- ADDED ---
-  configTime(19800, 0, "pool.ntp.org", "time.nist.gov"); // Sync NTP (IST +5:30)
+  configTime(19800, 0, "pool.ntp.org", "time.nist.gov"); // IST +5:30
+  Serial.println("[TIME] Syncing NTP...");
+  delay(2000);
+  lastSyncedEpoch = time(nullptr);
+  lastMillisBase = millis();
+  lastNtpSync = millis();
+  printLocalTime();
+
   loadFromEEPROM();
 }
 
+// ------------------------
+// MAIN LOOP
+// ------------------------
 void loop() {
   if (WiFi.status() != WL_CONNECTED) connectWiFi();
   if (!client.connected()) connectMQTT();
   client.loop();
 
+  syncNtpIfNeeded();  // maintain time accuracy every 30 min
+
   static unsigned long lastCheck = 0;
-  if (millis() - lastCheck > 60000) { // Check every minute
-    lastCheck = millis();
+  static unsigned long lastTimePrint = 0;
+  unsigned long now = millis();
+
+  if (now - lastCheck > 1000) {  // check schedules every 1 sec
+    lastCheck = now;
     checkSchedules();
+  }
+
+  if (now - lastTimePrint > 5000) { // print time every 5s
+    lastTimePrint = now;
+    printLocalTime();
   }
 }
