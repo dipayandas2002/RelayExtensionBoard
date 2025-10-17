@@ -27,14 +27,16 @@
 
     const NUM_RELAYS = 4;
     const states = {};
+    const timers = {}; // NEW
     const topicsCommand = [];
     const topicsStatus  = [];
     const topicGetStates = "home/relay/get_states";
-    const topicSetTimer  = "home/relay/set_timer"; // <--- NEW
+    const topicSetTimer  = "home/relay/set_timer";
 
     for (let i = 1; i <= NUM_RELAYS; i++) {
       topicsCommand.push(`home/relay${i}/command`);
       topicsStatus.push(`home/relay${i}/status`);
+      timers[i] = { on: "", off: "", enabled: false };
     }
 
     const client = mqtt.connect(mqttServer, {
@@ -87,18 +89,20 @@
 
       relayContainer.appendChild(div);
 
-      const checkbox = document.getElementById(`relay${i}`);
+      const relaySwitch = document.getElementById(`relay${i}`);
+      const enableBox   = document.getElementById(`enableTimer${i}`);
+      const saveBtn     = document.getElementById(`saveTimer${i}`);
+
       states[i] = false;
 
-      // Manual toggle
-      checkbox.addEventListener('change', () => {
-        const state = checkbox.checked ? "ON" : "OFF";
+      // Manual ON/OFF control
+      relaySwitch.addEventListener('change', () => {
+        const state = relaySwitch.checked ? "ON" : "OFF";
         client.publish(topicsCommand[i - 1], state);
         lastCommandEl.textContent = `Relay ${i} -> ${state}`;
       });
 
-      // Timer save button
-      const saveBtn = document.getElementById(`saveTimer${i}`);
+      // Save timer button
       saveBtn.addEventListener('click', () => {
         const onTime = document.getElementById(`onTime${i}`).value;
         const offTime = document.getElementById(`offTime${i}`).value;
@@ -118,36 +122,62 @@
 
         client.publish(topicSetTimer, JSON.stringify(json));
         lastCommandEl.textContent = `Relay ${i} Timer -> ${onTime} to ${offTime} (${enabled ? "ENABLED" : "DISABLED"})`;
-        console.log("[MQTT] Timer sent:", json);
+        console.log("[MQTT] Timer saved:", json);
+      });
+
+      // ✅ NEW: Enable/Disable checkbox live updates to ESP
+      enableBox.addEventListener('change', () => {
+        const enabled = enableBox.checked;
+        const onTime = document.getElementById(`onTime${i}`).value || timers[i].on;
+        const offTime = document.getElementById(`offTime${i}`).value || timers[i].off;
+
+        const json = {
+          relay: i,
+          on: onTime,
+          off: offTime,
+          enabled: enabled
+        };
+        client.publish(topicSetTimer, JSON.stringify(json));
+        lastCommandEl.textContent = `Relay ${i} Enable -> ${enabled ? "ENABLED" : "DISABLED"}`;
+        console.log("[MQTT] Enable updated:", json);
       });
     }
 
-    // MQTT CONNECTION EVENTS
+    // MQTT EVENTS
     client.on('connect', () => {
       console.log("✅ Connected to MQTT broker");
-
       topicsStatus.forEach(t => client.subscribe(t));
       client.subscribe(topicGetStates);
-
-      // Get initial relay states
-      client.publish(topicGetStates, "request");
+      client.publish(topicGetStates, "request"); // Get latest state & timers
     });
 
     client.on('error', err => console.error("❌ MQTT Error:", err));
 
+    // Handle MQTT Messages
     client.on('message', (topic, message) => {
       const msg = message.toString();
       const relayIndex = topicsStatus.indexOf(topic);
 
       if (relayIndex !== -1) {
-        const state = msg.includes("ON");
-        states[relayIndex + 1] = state;
-        const checkbox = document.getElementById(`relay${relayIndex + 1}`);
-        if (checkbox) checkbox.checked = state;
-      }
+        try {
+          const data = JSON.parse(msg);
+          const i = relayIndex + 1;
+          document.getElementById(`relay${i}`).checked = data.state === "ON";
 
-      if (topic === topicGetStates) {
-        console.log("[INFO] Get states response:", msg);
+          if (data.on && data.off) {
+            document.getElementById(`onTime${i}`).value = data.on;
+            document.getElementById(`offTime${i}`).value = data.off;
+            timers[i].on = data.on;
+            timers[i].off = data.off;
+          }
+
+          document.getElementById(`enableTimer${i}`).checked = !!data.enabled;
+          timers[i].enabled = !!data.enabled;
+          console.log(`[SYNC] Relay ${i} updated from broker`, data);
+
+        } catch (e) {
+          console.warn("Invalid JSON message:", msg);
+        }
       }
     });
   </script>
